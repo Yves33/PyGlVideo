@@ -51,13 +51,13 @@ settings={
             ## with hwaccel='cuda' and is_hw_owned=True, av outputs 1 large y+uv plane (w, h*3//2)
             ## with hwaccel='cuda' and is_hw_owned=False, av outputs y and uv planes
             ## with hwaccel=None and is_hw_owned=False, av outputs y, u and v planes
-            'hwaccel':None,     ## the difference is not that big, unless is_hw_owned==True. cuda may be a little faster.
-            'is_hw_owned':False,   ## keep data to cuda on hw, otherwise is fetched back to cpu
+            'hwaccel':'cuda',     ## the difference is not that big, unless is_hw_owned==True. cuda may be a little faster.
+            'is_hw_owned':True,   ## keep data to cuda on hw, otherwise is fetched back to cpu
             },
         'vali':{
             ## vali decoder has the option do convert the surface to rgb, yuv, or keep nv12
-            'tgt_format':'rgb', ## keep data to cuda on hw, otherwise is fetched back to cpu
-            'is_hw_owned':False,
+            'tgt_format':'nv12', ## keep data to cuda on hw, otherwise is fetched back to cpu
+            'is_hw_owned':True,
             },
         'pil':{},
         },

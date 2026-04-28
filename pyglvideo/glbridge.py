@@ -50,12 +50,14 @@ def __gl_unpack__(plane):
                                         shape=(plane.height, plane.width)).__dlpack__())['dl_tensor']
         
     height,width=info['shape'][0],info['shape'][1]
-    if len(info['shape'])<3:
-        stride=info['strides'][0] if info['strides'] else width
-        n_components=stride//width  # info['shape'][2] if len(info['shape])>2 else 1
-    else: # numpy case
-        n_components=info['shape'][2]
-        stride=width*n_components
+    stride=info['strides'][0] if info['strides'] else list(itertools.accumulate(info['shape'][1:],lambda a,b:a*b))[-1]
+    n_components=info['shape'][2] if len(info['shape'])>2 else stride//width
+    # if True or len(info['shape'])<3:
+    #     stride=info['strides'][0] if info['strides'] else width
+    #     n_components=stride//width  # info['shape'][2] if len(info['shape])>2 else 1
+    # else: # numpy case
+    #     n_components=info['shape'][2]
+    #     stride=width*n_components
     width_in_bytes=stride       #*n_components
     size_in_bytes=width_in_bytes*height
     ptr=info['data']
