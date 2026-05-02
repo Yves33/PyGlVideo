@@ -45,9 +45,15 @@ def __gl_unpack__(plane):
         ## pycapsule=np.array(plane).reshape(plane.height,plane.width).__dlpack__()
         ## but we can re-create the np.array using ctypes
         ## the code assumes that plane.__dlpack__() never fails when data is on gpu!
-        ##
-        info=dlpack.todict(np.ctypeslib.as_array(cast(plane.buffer_ptr,POINTER(c_byte)), 
-                                        shape=(plane.height, plane.width)).__dlpack__())['dl_tensor']
+        ## because stride may be present, we cannot directly use ctypeslib.asarray().__dlpack__
+        #info=dlpack.todict(np.ctypeslib.as_array(cast(plane.buffer_ptr,POINTER(c_byte)), 
+        #                                shape=(plane.height, plane.width)).__dlpack__())['dl_tensor']
+        _buf=np.ctypeslib.as_array(cast(plane.buffer_ptr,POINTER(c_byte)), 
+                                        shape=(1,plane.buffer_size))
+        info=dlpack.todict(np.lib.stride_tricks.as_strided(_buf,
+                                                           shape=(plane.height, plane.width),
+                                                           strides=(plane.line_size, 1),
+                                                           ).__dlpack__())['dl_tensor']
         
     height,width=info['shape'][0],info['shape'][1]
     stride=info['strides'][0] if info['strides'] else list(itertools.accumulate(info['shape'][1:],lambda a,b:a*b))[-1]
@@ -76,56 +82,12 @@ def __gl_unpack__(plane):
                           typestr=None ## don't need it
                           )
     
-'''def __gl_unpack__old(plane):
-    ## old version using local dlpack.py
-    try:
-        pycapsule=plane.__dlpack__()
-    except:
-        ## when av exports planar format, it outputs an unidimensionnal buffer
-        ## unfortunately, reshaping copies the buffer!
-        ## pycapsule=np.array(plane).reshape(plane.height,plane.width).__dlpack__()
-        ## but we can re-create the np.array using ctypes
-        ## the code assumes that plane.__dlpack__() never fails when data is on gpu!
-        ##
-        pycapsule=np.ctypeslib.as_array(cast(plane.buffer_ptr,POINTER(c_byte)), 
-                                        shape=(plane.height, plane.width)).__dlpack__()
-    dl_managed_tensor = ctypes.pythonapi.PyCapsule_GetPointer(pycapsule, _c_str_dltensor)
-    dl_managed_tensor_ptr = ctypes.cast(dl_managed_tensor, ctypes.POINTER(DLManagedTensor))
-    info=dl_managed_tensor_ptr.contents.__array_interface__
-    ##
-    height,width=info['shape'][0],info['shape'][1]
-    stride=info['strides'][0]
-    n_components=stride//width  # info['shape'][2] if len(info['shape])>2 else 1
-    width_in_bytes=stride       #*n_components
-    size_in_bytes=width_in_bytes*height
-    ptr=info['data'][0]
-    device_id=dl_managed_tensor_ptr.contents.dl_tensor.device.device_id
-    device_type=dl_managed_tensor_ptr.contents.dl_tensor.device.device_type
-    typestr=info['typestr']
-    return gl_unpack_info(height=height,
-                          width=width,
-                          stride=stride,
-                          components=n_components,
-                          width_in_bytes=width_in_bytes,
-                          size_in_bytes=size_in_bytes,
-                          ptr=ptr,
-                          device_id=device_id,
-                          device_type=device_type,
-                          typestr=typestr
-                          )'''
-
-## todo refactoring
-## CudaBridgeNV12   ==> GLunpackNV12 unpacks rgb to y+uv
-## GLBridgeNV12     ==> GLpackNV12   packs y+uv  (dlpack)  to OpenGL rgb texture
-## GLBridgeYUV420p  ==> GLpackYUVp   packs y+u+v (dlpack)  to OpenGL rgb texture
-## GLBridgeRGB      ==> GLpackRGB    packs rgb   (dlpack)  to OpenGL rgb texture
-## the api should be
-# gl_packer=GLPackNV12(tgt_texture)
-# gl_packer.blit(*args) # with args=(y,uv)|(y,u,v)|rgb with __dlpack__ attribute
-# gl_unpack=GLUnpackNV12(src_texture,tgt='cpu|cuda')
-# gl_unpack.blit(src_texture)
-# y =gl_unpack.y.__dlpack()__
-# uv=gl_unpack.uv.__dlpack()__
+## refactoring suggestions
+# class cuda_gl_buffer
+#   def __init__(self,size:int):
+#   def copy_from_from_dlpack(self,arr): fills buffer with content of arr
+#   @property
+#   def glo(self):returns the gl buffer identifier (or gl_id) 
 
 class GLBridgeOneshot:
     ## one shot blitter for still images
@@ -986,6 +948,7 @@ class GLBridgeYUV420:
                             cast(info.ptr,POINTER(c_byte))
                             )
                 dst_offset+=info.size_in_bytes
+                #Image.fromarray(np.ctypeslib.as_array(cast(info.ptr,POINTER(c_byte)),shape=(1440,1440))).show()
         elif all([nfo.device_type==2 for nfo in infos]): ## data is on cuda device
             cuda_pbo = RegisteredBuffer(pbo_)           ## in order to get gpu<->gpu copies in both encoder and decoder, one need to re-register the buffer!
             buffer_mapping = cuda_pbo.map()

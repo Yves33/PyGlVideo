@@ -244,7 +244,7 @@ class WindowEvents(mglw.WindowConfig):
         else:
             PYCUDA_GL_AVAILABLE=False
         if self.player.backend in['av','vali']:
-            if self.player.grabber.px_format in ['yuv420p','yuv420','yuv444']:
+            if self.player.grabber.px_format in ['yuv420p','yuv420','yuvj420p','yuv444']:
                 self.bridge=GLBridgeYUV420(self.player.grabber,self.player_texture.glo,self.player.grabber.px_format)
             elif self.player.grabber.px_format in ['nv12','cuda']:
                 self.bridge=GLBridgeNV12(self.player.grabber,self.player_texture.glo)
