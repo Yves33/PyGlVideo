@@ -69,11 +69,12 @@ settings={
             ## with hwaccel=None and is_hw_owned=False, av outputs y, u and v planes
             'hwaccel':'cuda',     ## the difference is not that big, unless is_hw_owned==True. cuda may be a little faster.
             'is_hw_owned':True,   ## keep data on gpu, otherwise is fetched back to cpu
+            'tgt_format':None,
             },
         'vali':{
             ## vali decoder has the option do convert the surface to rgb, yuv420p, nv12
-            'tgt_format':'yuv420p', ## keep data to cuda on hw, otherwise is fetched back to cpu
-            'is_hw_owned':True,
+            'tgt_format':'rgb', ## keep data to cuda on hw, otherwise is fetched back to cpu
+            'is_hw_owned':False,
             },
         'pil':{},
         },
@@ -110,7 +111,7 @@ settings={
             },
         }
 }
-BACKEND='vali'
+BACKEND='av'
 TEST_RECORDING=True
 
 class FPSCounter:
@@ -272,7 +273,7 @@ class WindowEvents(mglw.WindowConfig):
                 self.bridge=GLBridgeYUV420(self.player.grabber,self.player_texture.glo,self.player.grabber.px_format)
             elif self.player.grabber.px_format in ['nv12','cuda']:
                 self.bridge=GLBridgeNV12(self.player.grabber,self.player_texture.glo)
-            elif self.player.grabber.px_format in ['rgb']:
+            elif self.player.grabber.px_format in ['rgb','rgb24']:
                 self.bridge=GLBridgeRGB(self.player.grabber,self.player_texture.glo)
             else:
                 print(f"unknown pixel format:{self.player.grabber.px_format}")

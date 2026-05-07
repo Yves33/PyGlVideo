@@ -27,7 +27,7 @@ except:
     PIL_AVAILABLE=False
 
 def FrameGrabber(*args, **kwargs):
-    av_kwargs=['hwaccel','is_hw_owned']
+    av_kwargs=['hwaccel','is_hw_owned','tgt_format']
     pil_kwargs=['fps','framecount']
     vali_kwargs=['gpuid','is_hw_owned','tgt_format']
     nv_kwargs=['gpuid','is_hw_owned','tgt_format']

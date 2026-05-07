@@ -14,6 +14,7 @@ class FrameGrabberAV(object):
         self.first_pts=-1
         self.backend='av'
         self.hwaccel=kwargs.pop('hwaccel',None)
+        self.convert_rgb=kwargs.pop('tgt_format',None)
         self.is_hw_owned=kwargs.pop('is_hw_owned',False) if self.hwaccel=='cuda' else False
 
     def __frameiter(self):
@@ -115,7 +116,10 @@ class FrameGrabberAV(object):
             ## because we need to always have something valid in self.decoded
             _decoded=next(self._frames)
             if _decoded:
-                self.decoded=_decoded
+                if self.convert_rgb:
+                    self.decoded=_decoded.to_rgb()
+                else:
+                    self.decoded=_decoded
                 return True
         except StopIteration:
             self._frames=self.__frameiter()
