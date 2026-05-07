@@ -1,21 +1,6 @@
-import logging
-from ctypes import c_void_p
-
 import python_vali as vali      # using VALI
 import numpy as np
-from OpenGL.GL import *
 import av
-try:
-    import pycuda
-    PYCUDA_AVAILABLE=True
-    try:
-        from pycuda.gl import RegisteredBuffer
-        PYCUDA_GL_AVAILABLE=True
-    except:
-        PYCUDA_GL_AVAILABLE=False
-except:
-    PYCUDA_AVAILABLE=False
-    PYCUDA_GL_AVAILABLE=False
 ffps={
     '59.94' : av.utils.Fraction(60000,1001),
     '119.88': av.utils.Fraction(120000,1001),
@@ -178,64 +163,32 @@ class FrameRecorderVALI:
         self.out_stream.height = self.height
         self.framecnt=0
         
-        if PYCUDA_GL_AVAILABLE:
-            self.pbosize=self.width*self.height*3
-            self.pbo=glGenBuffers(1)
-            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, self.pbo)
-            glBufferData(GL_PIXEL_UNPACK_BUFFER, self.pbosize, c_void_p(0),GL_STREAM_DRAW)
-            #self.cuda_pbo = RegisteredBuffer(int(self.pbo))
-            self.rgb_surface=vali.Surface.Make(vali.PixelFormat.RGB,self.width,self.height, self.device)
-            self.to_gpu.Run(np.array([0]*self.width*self.height*3,dtype=np.uint8),self.rgb_surface)
+        self.rgb_surface=vali.Surface.Make(vali.PixelFormat.RGB,self.width,self.height, self.device)
+        self.to_gpu.Run(np.array([0]*self.width*self.height*3,dtype=np.uint8),self.rgb_surface)
 
-            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0)
-            logging.getLogger().info("Using direct OpenGL to nvenc path")
+    def putframe(self,data,cpy="gpu"):
+        ## putframes only accepts tuples of video planes, either numpy or other!
+        ## VALI only accepts RGB frames, but performs the convertion in hardware
+        if not isinstance(data,tuple) and len(data)!=1:
+            raise ValueError(f"{self.__class__.__name__}.putframe only accepts 1 item length tuples")
+        if isinstance(data[0],np.ndarray) \
+            or hasattr(data[0],'__buffer__')\
+            or hasattr(data[0],'__array_interface__'):
+            self.to_gpu.Run(np.array(np.frombuffer(data[0],dtype=np.uint8)),self.rgb_surface)
+        elif(hasattr(data[0],'__dlpack__')) and data[0].__dlpack_device__()[0]==2:
+            self.rgb_surface=vali.Surface.from_dlpack(data[0].__dlpack__(),format=vali.PixelFormat.RGB)
         else:
-            logging.getLogger().info("Could not setup direct path from openGL to hadware encoder")
-            logging.getLogger().info("Uning CPU copies instead")
+            raise ValueError(f"tuple elements for {self.__class__.__name__}.putframe must be np.arrays, or implement one of __dlpack__(), __array_interface__(), __buffer__(),")
 
-    def putframe(self,data,gpucpy=True):
-        if not isinstance(data,int):
-            self.rgb_surface = self.to_gpu.UploadSingleFrame(np.array(np.frombuffer(data,dtype=np.uint8)))
-        else:
-            if not gpucpy or not PYCUDA_GL_AVAILABLE:
-                ## read texture data into system memory, then send it back to gpu
-                glActiveTexture(GL_TEXTURE0)
-                glBindTexture(GL_TEXTURE_2D, data)
-                glBindBuffer(GL_PIXEL_PACK_BUFFER,0)
-                buffer=glGetTexImage(GL_TEXTURE_2D,0,GL_RGB,GL_UNSIGNED_BYTE)
-                self.to_gpu.Run(np.array(np.frombuffer(buffer,dtype=np.uint8)),self.rgb_surface)
-            else:
-                ## read texture data into buffer
-                glActiveTexture(GL_TEXTURE0)
-                glBindTexture(GL_TEXTURE_2D, data)
-                glBindBuffer(GL_PIXEL_PACK_BUFFER, int(self.pbo))
-                glGetTexImage(GL_TEXTURE_2D,0,GL_RGB,GL_UNSIGNED_BYTE,array=c_void_p(0))
-                ## copy to rgb_surface
-                cuda_pbo = RegisteredBuffer(int(self.pbo))
-                buffer_mapping = cuda_pbo.map()
-                buffptr,buffsize=buffer_mapping.device_ptr_and_size()
-                cpy = pycuda.driver.Memcpy2D()
-                cpy.set_dst_device(self.rgb_surface.Planes[0].GpuMem)
-                cpy.set_src_device(buffptr)
-                cpy.width_in_bytes = self.width*3 
-                cpy.src_pitch = self.width*3
-                cpy.dst_pitch = self.rgb_surface.Planes[0].Pitch
-                cpy.height = self.rgb_surface.Planes[0].Height
-                cpy(aligned=False)
-                pycuda.driver.Context.synchronize()
-                buffer_mapping.unmap()
-                glBindBuffer(GL_PIXEL_PACK_BUFFER, 0)
-
-        ## convert rgb data in self.rgbsurface to nv12
-        ## the rest is just a matter of converting pixels
         rawnv12=self.to_nv12o.run(self.rgb_surface)
-        import time
-        time.sleep(0.001) ## we must wait for conversion to finish! maybe the bug is solved?
+        #import time
+        #time.sleep(0.001) ## we must wait for conversion to finish! maybe the bug is solved?
         success = self.nv_enc.EncodeSingleSurface(rawnv12, self.enc_frame, sync = True)
         if success:
             self.mux(self.enc_frame)
 
     def mux(self,frame):
+        ##av is required for muxing..., which limits the interest of VALI
         encByteArray = bytearray(self.enc_frame)  # encFrame from EncodeSingleSurface
         pkt = av.packet.Packet(self.enc_frame)
         pkt.pts = self.framecnt*self.fps_den

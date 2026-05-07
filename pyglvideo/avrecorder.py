@@ -1,11 +1,7 @@
 import av
 import numpy as np
-from OpenGL.GL import *
-from fractions import Fraction
 
 ffps={
-    '59.94' : av.utils.Fraction(60000,1001),
-    '119.88': av.utils.Fraction(120000,1001),
     '23.98' : av.utils.Fraction(24000,1001),#120000,5005
     '24.00' : av.utils.Fraction(90000,3750),
     '25.00' : av.utils.Fraction(90000,3600),
@@ -90,21 +86,17 @@ class FrameRecorderAV:
         pass
 
     def putframe(self,data,*args,**kwargs):
-        ## see https://github.com/PyAV-Org/PyAV/issues/596 for hardware encoding
-        ## in 1080p, getting the rgb buffer from opengl and converting to yuv420 (without encoding)
-        ## induces a frame drop from ~160 fps to ~65 fps
-        ## encoding induces a frame drop to ~18/19 fps
-        ## not event worth doing rgb to yuv in hardware
-        if isinstance(data,int):
-            glActiveTexture(GL_TEXTURE0)
-            glBindTexture(GL_TEXTURE_2D, data)
-            buffer=glGetTexImage(GL_TEXTURE_2D,0,GL_RGB,GL_UNSIGNED_BYTE)
-            ##buffer=glReadPixels(0,0,self.width, self.height,GL_RGB,GL_UNSIGNED_BYTE)
-            #from PIL import Image
-            #Image.frombytes('RGB', (self.width,self.height),buffer).show()
-            frame=av.VideoFrame.from_ndarray(np.frombuffer(buffer,dtype=np.ubyte).reshape(self.height,self.width,3))
-        elif isinstance(data, tuple) and len(data)==2:
+        ## putframes only accepts tuples of video planes, either numpy or other!
+        ## av accepts 
+        # - cpu RGB frames
+        # - cpu Y+UV frames
+        # - cuda Y+UV frames
+        # - cpu Y+U+V frames (not implemented, but should be doable)
+        if not isinstance(data,tuple) and len(data)>3:
+            raise ValueError(f"{self.__class__.__name__}.putframe only accepts 1 item length tuples")
+        elif len(data)==2:
             assert(self.stream.pix_fmt=='nv12')
+            assert(hasattr(data[0],'__dlpack__'))
             frame=av.VideoFrame.from_dlpack(data,format='nv12')
             #from PIL import Image
             #y=data[0][::2,::2]
@@ -113,12 +105,43 @@ class FrameRecorderAV:
             #Image.merge('YCbCr', (Image.fromarray(np.uint8(y)), 
             #                      Image.fromarray(np.uint8(u)),
             #                      Image.fromarray(np.uint8(v)))).show()
+        elif (len(data)==1) and (isinstance(data[0],np.ndarray) \
+                                or hasattr(data[0],'__buffer__')\
+                                or hasattr(data[0],'__array_interface__')):
+            frame=av.VideoFrame.from_ndarray(np.frombuffer(data[0],dtype=np.ubyte).reshape(self.height,self.width,3))
+        else:
+            raise ValueError(f"{self.__class__.__name__} only accepts tuples matching the following scheme\n"+
+                             "(rgb,) with rgb being np.array or any oject implementing __array_interface__ or __buffer__\n"+
+                             "(y,uv) with y,uv being any oject implementing __dlpack__ protocol\n"
+                             )
+
+
+        # elif isinstance(data, tuple) and hasattr(data[0],'__dlpack__'):
+        #     if len(data)==1: ##data is GL_RGB, dlpack compliant
+        #         ## currently not supported
+        #         ## from_dlpack currently supports 2-plane formats only (nv12/p010le/p016le)
+        #         #frame=av.VideoFrame.from_dlpack(data,format='rgb')
+        #         frame=av.VideoFrame.from_ndarray(data[0].reshape(self.height,self.width,3))
+        #     elif len(data)==2:
+        #         assert(self.stream.pix_fmt=='nv12')
+        #         frame=av.VideoFrame.from_dlpack(data,format='nv12')
+        #         #from PIL import Image
+        #         #y=data[0][::2,::2]
+        #         #u=data[1][:,::2]
+        #         #v=data[1][:,1::2]
+        #         #Image.merge('YCbCr', (Image.fromarray(np.uint8(y)), 
+        #         #                      Image.fromarray(np.uint8(u)),
+        #         #                      Image.fromarray(np.uint8(v)))).show()
+        #     elif len(data)==3: ##data is GL_RGB, dlpack compliant
+        #         ## currently not supported
+        #         ## from_dlpack currently supports 2-plane formats only (nv12/p010le/p016le)
+        #         frame=av.VideoFrame.from_dlpack(data,format='yuv420p')
+        # elif isinstance(data,np.ndarray):
+        #     frame=av.VideoFrame.from_ndarray(data.reshape(self.height,self.width,3))
+        # elif isinstance(data,bytes):
+        #     frame=av.VideoFrame.from_ndarray(np.frombuffer(data,dtype=np.ubyte).reshape(self.height,self.width,3))
         
-        
-        elif isinstance(data,np.ndarray):
-            frame=av.VideoFrame.from_ndarray(data)
-        elif isinstance(data,bytes):
-            frame=av.VideoFrame.from_ndarray(np.frombuffer(data,dtype=np.ubyte).reshape(self.height,self.width,3))
+        ## mux the frame
         for packet in self.stream.encode(frame):
             self.container.mux(packet)
 

@@ -27,7 +27,7 @@ class FrameGrabberPIL(object):
         self._image=Image.open(filename)
         self.width,self.height  = self._image.size
         self.planes=[np.array(self._image.convert('RGB'))]
-        self.format='rgb'
+        self.px_format='rgb'
         self.frames_per_sec=fractions.Fraction(30000,1001) ## could be parsed from kwargs
         self.frame_info=FrameInfo(pts=0,
                                   time_base=fractions.Fraction(self.frames_per_sec.numerator,1),

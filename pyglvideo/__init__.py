@@ -4,7 +4,7 @@ warnings.filterwarnings("ignore", message=".*g_value_get_string.*")
 import logging
 logging.getLogger().setLevel(logging.ERROR)
 
-from .glbridge import GLBridgeRGB,GLBridgeYUV420,GLBridgeNV12,GLBridgeOneshot,CudaBridgeNV12
+from .glbridge import GLBridgeRGB,GLBridgeYUV420,GLBridgeNV12,GLBridgeOneshot,CudaBridgeNV12,CudaBridgeRGB
 
 try:
     from .avgrabber import FrameGrabberAV

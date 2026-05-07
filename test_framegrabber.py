@@ -1,4 +1,7 @@
 import os, pathlib
+os.environ["TEST_VIDEO_FILE"]="/home/yves/Devel/python/assets/videos/equi/rossa_equi.mp4"
+#os.environ["TEST_VIDEO_FILE"]="/home/yves/Devel/python/assets/videos/flat/windsurf_stamped.mkv"
+#os.environ["TEST_VIDEO_FILE"]="/home/yves/Devel/python/assets/images/flat/windsurf.jpg"
 if not "TEST_VIDEO_FILE" in os.environ:
     print("You must define TEST_VIDEO_FILE environment variable to point to a video file for testing. ")
     exit()
@@ -16,6 +19,8 @@ if os.environ["IMGUI_IMPL"]!="BUNDLE":
     import imgui
     from moderngl_window.integrations.imgui import ModernglWindowRenderer
     ImTextureRef=lambda x:x
+    Vec2=lambda x,y:[x,y]
+    get_content_region_avail=lambda:imgui.get_content_region_available()
     naked_window_flags=imgui.WINDOW_NO_SCROLLBAR|imgui.WINDOW_NO_COLLAPSE
     text_input_flags=imgui.INPUT_TEXT_ENTER_RETURNS_TRUE
     BUNDLEAPI='bundle' in str(imgui)
@@ -23,28 +28,39 @@ else:
     from imgui_bundle import imgui
     from moderngl_window_integrations_imgui_bundle import ModernglWindowRenderer
     ImTextureRef=lambda x:imgui.ImTextureRef(x)
+    Vec2=lambda x,y: (imgui.ImVec2(x,y),)
+    get_content_region_avail=lambda:imgui.get_content_region_avail()
     naked_window_flags=imgui.WindowFlags_.no_scrollbar|imgui.WindowFlags_.no_collapse
     text_input_flags=imgui.InputTextFlags_.enter_returns_true
+    vec2=lambda x,y:imgui.ImVec2(x,y)
     BUNDLEAPI='bundle' in str(imgui)
-
-try:
-    import pycuda
-    PYCUDA_AVAILABLE=True
-except:
-    PYCUDA_AVAILABLE=False
 
 from pyglvideo import FrameGrabber
 from pyglvideo import FrameRecorder
 from pyglvideo import (GLBridgeYUV420,   # for gpu->(cpu)->gl->yuv_2_rgb
                      GLBridgeNV12,     # for gpu->(cpu)->gl->nv12_2_rgb
                      GLBridgeRGB,      # for gpu->(cpu)->gl
-                     CudaBridgeNV12,   # for avgl->y+uv->cuda->__dlpack__
+                     CudaBridgeNV12,   # for gl->y+uv->cuda/cpu->__dlpack__
+                     CudaBridgeRGB,    # for gl->cuda/cpu->__dlpack__
                      )
 
 ## notes
 ## GLBridgeYUV420 handles both yuv420 and yuv444. could be easily adapted to any planar format (rgb_planar)
 ## GLBridgeNV12   handles both nv12 and nv24 (not tested). could be easily adapted for nv16
 ## RGB            handles interleaved rgb. no shader, no brightness / contrast adjustment
+
+## about pixel formats:
+## AV backend
+## - hw_accel='cuda' & 'is_hw_owned'=True  => 2 gpu buffers(y+uv)
+## - hw_accel='cuda' & 'is_hw_owned'=False => 2 cpu buffers(y+uv)
+## - hw_accel=None or options={}           => 3 cpu buffers (y+u+v)
+## VALI backend
+## - tgt_format='nv12' & is_hw_owned=True    => 1 gpu buffer (y+uv, height=img_height*3/2)
+## - tgt_format='nv12' & is_hw_owned=False   => 2 cpu buffer (y+uv)
+## - tgt_format='yuv420' & is_hw_owned=True  => 3 gpu buffer (y+uv)
+## - tgt_format='yuv420' & is_hw_owned=False => 3 cpu buffer (y+uv)
+## - tgt_format='rgb' & is_hw_owned=True     => 1 gpu buffer (rgb)
+## - tgt_format='rgb' & is_hw_owned=False    => 1 cpu buffer (rgb)
 settings={
     'dec':{
         'av':{
@@ -52,15 +68,16 @@ settings={
             ## with hwaccel='cuda' and is_hw_owned=False, av outputs y and uv planes
             ## with hwaccel=None and is_hw_owned=False, av outputs y, u and v planes
             'hwaccel':'cuda',     ## the difference is not that big, unless is_hw_owned==True. cuda may be a little faster.
-            'is_hw_owned':True,   ## keep data to cuda on hw, otherwise is fetched back to cpu
+            'is_hw_owned':True,   ## keep data on gpu, otherwise is fetched back to cpu
             },
         'vali':{
-            ## vali decoder has the option do convert the surface to rgb, yuv, or keep nv12
-            'tgt_format':'nv12', ## keep data to cuda on hw, otherwise is fetched back to cpu
+            ## vali decoder has the option do convert the surface to rgb, yuv420p, nv12
+            'tgt_format':'yuv420p', ## keep data to cuda on hw, otherwise is fetched back to cpu
             'is_hw_owned':True,
             },
         'pil':{},
         },
+    
     'enc':{
         'vali': {
             'codec':'h264', ## h264 or hevc
@@ -73,6 +90,8 @@ settings={
                 'profile': 'high',
                 'gop':'15'
                 },
+            'glconvert':False,    ## For VALI, this should always be False
+            'is_hw_owned':True,   ## should we avoid cpu->cpu copies
             },
         'av':{
             'fps':29.97,
@@ -80,14 +99,19 @@ settings={
             ## pixel_format refers to destination pixel format, stored in stream. must be nv12 for gl->cuda direct transfer
             ## set gl_convert to perform rgb->nv12 conversion in shader
             ## to get cuda->opengl->cuda, use {'hwaccel':'cuda','is_hw_owned':True}
-            'codec':'h264_nvenc','options':{'pixel_format':'nv12','preset':'slow','crf':'22'},'glconvert':True,
-            #'codec':'h264_nvenc','options':{'pixel_format':'nv12','preset':'slow','crf':'22'},    'glconvert':False,
-            #'codec':'h264',      'options':{'pixel_format':'nv12','preset':'slow','crf':'22'},    'glconvert':True,
-            #'codec':'h264',      'options':{'pixel_format':'nv12','preset':'slow','crf':'22'},    'glconvert':False,
-            }
+            ## putframe now always recieve a tuple of np.arrays (when data is on cpu) or a tupple of dlpackObjects (when data is on gpu)
+            ## length of data is always 1 (rgb data) or 2 (y+uv data)
+            'codec':'h264_nvenc','options':{'pixel_format':'nv12','preset':'slow','crf':'22'},
+            #'codec':'h264_nvenc','options':{'pixel_format':'nv12','preset':'slow','crf':'22'},
+            #'codec':'h264',      'options':{'pixel_format':'nv12','preset':'slow','crf':'22'},
+            #'codec':'h264',      'options':{'pixel_format':'nv12','preset':'slow','crf':'22'},
+            'glconvert':True,    ## wether rgb to yuv should be performed on the gl side, or delegated to recorder
+            'is_hw_owned':True,   ## should we avoid cpu->cpu copies
+            },
         }
 }
-BACKEND='av'
+BACKEND='vali'
+TEST_RECORDING=True
 
 class FPSCounter:
     def __init__(self,interval):
@@ -194,32 +218,40 @@ class WindowEvents(mglw.WindowConfig):
         self.cliptime=0
         self.last_ticks=-1
 
-        ## we can directly send rgb frames to av that will convert them to appropriate pixel format
-        ## we can also perform rgb->nv12 conversion in shader, 
-        ## in which case we can transfer data to av either thrrough np array or gpu array
-        ## for the demo, we always create the gl rgb_to_nv12 conversion
-        ## if glconvert is False: data is forwarded to av as rgb buffer
-        ## if glconvert is True:
-        ##   if encoder is xx_nvenc: data is forwarded to av through y+uv cuda buffers (__dlpack__())
-        ##   otherwise: data is forwarded through y+uv numpy buffers (__dlpack__()) 
+        ## AV|VALIFrameEncoder do not fetch data from opengl directly,
+        ## one need to pass them videoplanes in the following format:
+        ## av: 
+        ## - putframe((rgb,)) (rgb being cpu only)
+        ## - putframe((y,uv)) (y & uv being cpu or gpu)
+        ## vali:
+        ## - putframe((rgb,)) (rgb being cpu or gpu) - vali takes care of convertion
+        ## obviously, some combinations may not work (eg sending y+uv(gpu) when encoder is not hw)
+        ## all combinations have not been tested!
+        if TEST_RECORDING and settings["enc"][BACKEND]['glconvert']:
+            self.glbridge=CudaBridgeNV12(self.fbo.color_attachments[0].glo,
+                                        self.fbo_width,self.fbo_height,
+                                        target='cuda' if settings['enc'][BACKEND]['is_hw_owned'] else 'cpu'
+                                        )
+            ## for debugging rgb2nv12, make sure that we can display the textures in imgui
+            self.ytex=self.ctx.external_texture(self.glbridge.ytex,
+                                            (self.glbridge.width,self.glbridge.height),
+                                            1,0,
+                                            'f1')
+            self.imgui.register_texture(self.ytex)
+            self.uvtex=self.ctx.external_texture(self.glbridge.uvtex,
+                                            (self.glbridge.width,self.glbridge.height),
+                                            2,0,
+                                            'f1')
+            self.imgui.register_texture(self.uvtex)
+        elif TEST_RECORDING:
+            self.glbridge=CudaBridgeRGB(self.fbo.color_attachments[0].glo,
+                                        self.fbo_width,self.fbo_height,
+                                        target='cuda' if settings['enc'][BACKEND]['is_hw_owned'] else 'cpu'
+                                        )
 
-        self.cudabridge=CudaBridgeNV12(self.fbo.color_attachments[0].glo,
-                                       self.fbo_width,self.fbo_height,
-                                       target='cuda' if 'nvenc' in settings['enc']['av']['codec'] else 'cpu')
-        ## for debugging rgb2nv12, make sure that we can display the textures in imgui
-        self.ytex=self.ctx.external_texture(self.cudabridge.ytex,
-                                        (self.cudabridge.width,self.cudabridge.height),
-                                        1,0,
-                                        'f1')
-        self.imgui.register_texture(self.ytex)
-        self.uvtex=self.ctx.external_texture(self.cudabridge.uvtex,
-                                        (self.cudabridge.width,self.cudabridge.height),
-                                        2,0,
-                                        'f1')
-        self.imgui.register_texture(self.uvtex)
+
 
     def loadfile(self,srcfile,backend='av',width=None,height=None):
-        global PYCUDA_AVAILABLE,PYCUDA_GL_AVAILABLE
         if pathlib.Path(srcfile).suffix.lower() in ['.jpg','.png']:
             backend='pil'
         ## perform some cleanup - not really required for demo
@@ -234,15 +266,7 @@ class WindowEvents(mglw.WindowConfig):
         self.player=MovieController(FrameGrabber(backend=backend,**settings['dec'][BACKEND]))
         self.player.load(srcfile)
         self.player_texture=self.ctx.texture((self.player.width,self.player.height),3,None)
-        if PYCUDA_AVAILABLE:
-            try:
-                import pycuda.autoinit
-                import pycuda.gl.autoinit
-                PYCUDA_GL_AVAILABLE=True
-            except:
-                PYCUDA_GL_AVAILABLE=False
-        else:
-            PYCUDA_GL_AVAILABLE=False
+        
         if self.player.backend in['av','vali']:
             if self.player.grabber.px_format in ['yuv420p','yuv420','yuvj420p','yuv444']:
                 self.bridge=GLBridgeYUV420(self.player.grabber,self.player_texture.glo,self.player.grabber.px_format)
@@ -279,9 +303,6 @@ class WindowEvents(mglw.WindowConfig):
             self.player.seek(frame=int(seekto_f))
             self.bridge.blit()
         seek,seekto_p=imgui.input_text("Jump to pts",f"{int(self.player.grabber.frame_info.pts)}",flags=text_input_flags)
-        #if seek and is_number(seekto_p):
-        #    self.player.seek(pos=int(seekto_p)*self.player.grabber._video.time_base)
-        #    self.bridge.blit()
         changed, self.recording=imgui.checkbox("Record output",self.recording)
         if changed:
             if self.recording:
@@ -311,7 +332,11 @@ class WindowEvents(mglw.WindowConfig):
         imgui.text(f" - index   :{self.player.grabber.movieidx}")
         imgui.text(f" - time    :{self.player.grabber.movieposition}")
         imgui.text("BUNDLE API" if BUNDLEAPI else "CLASSIC API")
-        imgui.text(f"Backend : {self.player.backend}")
+        imgui.text("Decoder:")
+        imgui.text(f" - backend : {self.player.backend}")
+        imgui.text(f" - bridge : {self.bridge.__class__.__name__}")
+        imgui.text(f" - pxformat : {self.player.grabber.px_format}")
+        imgui.text(f" - planes : {self.bridge.numplanes}")
         imgui.end()
         
         imgui.begin(f"Decoding RGB buffer", flags=naked_window_flags)
@@ -356,20 +381,21 @@ class WindowEvents(mglw.WindowConfig):
         self.wnd.use()
         
         ## theoretically, we only need this if we want the gl to perform rgb->nv12 conversion
-        self.cudabridge.blit() ## modifies the current viewport!
-        imgui.begin("Encoding - uv buffer")
-        width=imgui.get_content_region_avail()[0]
-        imgui.image(ImTextureRef(self.uvtex.glo),
-                    imgui.ImVec2(width,width*self.cudabridge.height/self.cudabridge.width),
-                    uv0=imgui.ImVec2(0,0),uv1=imgui.ImVec2(1.0,1.0))
-        imgui.end()
+        if self.glbridge:
+            self.glbridge.blit()
+        ##
+        if self.glbridge and isinstance(self.glbridge,CudaBridgeNV12):
+            imgui.begin("Encoding - uv buffer")
+            width=get_content_region_avail()[0]
+            imgui.image(ImTextureRef(self.uvtex.glo),
+                        *Vec2(width,width*self.glbridge.height/self.glbridge.width),
+                        uv0=(0,0),uv1=(1.0,1.0))
+            imgui.end()
         ##
 
         if newframe and self.recorder:
-            if BACKEND=='av' and settings['enc'][BACKEND]['glconvert']:
-                self.recorder.putframe((self.cudabridge.y_plane,self.cudabridge.uv_plane))
-            else:
-                self.recorder.putframe(int(self.fbo.color_attachments[0].glo),gpucpy=PYCUDA_AVAILABLE)
+            if self.glbridge:
+                self.recorder.putframe(self.glbridge.planes)
                
         imgui.render()
         self.imgui.render(imgui.get_draw_data())

@@ -1,21 +1,28 @@
 from OpenGL.GL import *
-from ctypes import c_void_p,c_byte,POINTER,cast
+from ctypes import c_void_p,c_byte,POINTER,memmove,cast
 from collections import namedtuple
 import numpy as np
 import itertools
-import dlpack
-try:
-    from pycuda.gpuarray import GPUArray ## requires pytools
-    from .cuda_wrap_pycuda_utils import CUDAMappedPBOPtr,cuda_memcpy_2d
-    CUDA_API='PYCUDA'
-except:
-    try:
-        from .cuda_wrap_cudapython_utils import GPUArray,CUDAMappedPBOPtr,cuda_memcpy_2d
-        CUDA_API='CUDAPYTHON'
-    except:
-        CUDA_API=None
 
+try:
+    import pycuda
+    from pycuda.gl import RegisteredBuffer
+    from pycuda.gpuarray import GPUArray ## requires pytools
+    import dlpack
+    ##from dlpack import asdlpack,todict
+except:
+    pass
+
+## for GPU blitter compatibility with VALI, we need to import ctypes and dlpack
 import ctypes
+ctypes.pythonapi.PyCapsule_GetPointer.restype = ctypes.c_void_p
+ctypes.pythonapi.PyCapsule_GetPointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
+
+
+## wget https://github.com/dmlc/dlpack/blob/main/apps/numpy_dlpack/dlpack/dlpack.py
+## can be replaced by https://github.com/pearu/pydlpack/blob/main/dlpack/__init__.py, which offers bi directionnal communication!
+#from .dlpack import _c_str_dltensor, DLManagedTensor
+
 ctypes.pythonapi.PyCapsule_GetPointer.restype = ctypes.c_void_p
 ctypes.pythonapi.PyCapsule_GetPointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
 
@@ -41,7 +48,6 @@ def __gl_unpack__(plane):
         ## because stride may be present, we cannot directly use ctypeslib.asarray().__dlpack__
         #info=dlpack.todict(np.ctypeslib.as_array(cast(plane.buffer_ptr,POINTER(c_byte)), 
         #                                shape=(plane.height, plane.width)).__dlpack__())['dl_tensor']
-        ## we have to use stride_tricks, which is mentionned as being dangerous!
         _buf=np.ctypeslib.as_array(cast(plane.buffer_ptr,POINTER(c_byte)), 
                                         shape=(1,plane.buffer_size))
         info=dlpack.todict(np.lib.stride_tricks.as_strided(_buf,
@@ -73,26 +79,16 @@ def __gl_unpack__(plane):
                           ptr=ptr,
                           device_id=device_id,
                           device_type=device_type,
-                          typestr=None
+                          typestr=None ## don't need it
                           )
 
-def dlpack_to_pbo(info,pbo,offset,dst_stride=None):
-    if info.device_type==1:  ## data is on cpu
-        glBufferSubData(GL_PIXEL_UNPACK_BUFFER,
-                            offset,  
-                            info.width_in_bytes*info.height,
-                            cast(info.ptr,POINTER(c_byte))
-                            )
-    elif info.device_type==2:
-        with CUDAMappedPBOPtr(pbo) as pbo_ptr:
-            cuda_memcpy_2d(src=info.ptr,
-                           dst=pbo_ptr+offset,
-                           width=dst_stride if dst_stride else info.width_in_bytes,
-                           height=info.height,
-                           spitch=info.stride,
-                           dpitch=dst_stride if dst_stride else info.stride
-                           )
-    
+## refactoring suggestions
+# class cuda_gl_buffer
+#   def __init__(self,size:int):
+#   def copy_from_from_dlpack(self,arr): fills buffer with content of arr
+#   @property
+#   def glo(self):returns the gl buffer identifier (or gl_id) 
+
 class GLBridgeOneshot:
     ## one shot blitter for still images
     def __init__(self,player,player_texture):
@@ -117,99 +113,12 @@ class GLBridgeOneshot:
                 )
         self.fired=True
 
-class CudaBridgeRGB:
-    def __init__(self,src_texture,width=None, height=None,px_format='rgb',target='cuda'):
-        ##pycuda/gl init requires a valid gl context!
-        if CUDA_API=='PYCUDA':
-            import pycuda.autoinit
-            import pycuda.gl.autoinit
-        
-        self.src_texture=src_texture
-        if width is None or height is None:
-            self.width=glGetTexLevelParameteriv(self.src_texture,0,GL_TEXTURE_WIDTH)
-            self.height=glGetTexLevelParameteriv(self.src_texture,0,GL_TEXTURE_HEIGHT)
-        else:
-            self.width=width
-            self.height=height
-        self.px_format=px_format
-        self.uv_scale=1
-        self.target=target ## if None or False, buffers wil not be created
-        if self.target:
-            self.mkbuffers()
-
-    def __del__(self):
-        try:
-            self.release()
-        except:
-            pass
-
-    def release(self):
-        ## must be explicilety called. we cannot rely on __del__ as grabage collection being asynchronous, 
-        ## the __del__ function may be called after the context has been destroyed
-        if self.target:
-            glDeleteBuffers(21,np.array([self.pbo_rgb]))                   # release pbo
-        del self.buffer_rgb
-
-    def mkshaders(self):
-        pass
-
-    def mktextures(self):
-        pass
-
-    def mkbuffers(self):
-        ## create PBO
-        self.pbosize_rgb=self.width*self.height*3
-        self.pbo_rgb=GLuint(0);glGenBuffers(1,self.pbo_rgb);self.pbo_rgb=self.pbo_rgb.value ## hack to make it work with pyglet
-        glBindBuffer(GL_PIXEL_UNPACK_BUFFER,self.pbo_rgb)
-        glBufferData(GL_PIXEL_UNPACK_BUFFER,self.pbosize_rgb,c_void_p(0),GL_STREAM_READ)
-        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0)
-        if self.target=='cuda':# and CUDA_API=='PYCUDA':
-            self.buffer_rgb=GPUArray((self.height,self.width*3),dtype=np.uint8)    
-        elif self.target=='cpu':
-            self.buffer_rgb=np.empty((self.height, self.width*3),dtype=np.uint8)
-
-    def blit(self):
-        ## transfer to buffers, either numpy or cuda!
-        if self.target=='cpu':
-            ## don't bother with pbo, fetch immediately the texture to cpu
-            glActiveTexture(GL_TEXTURE0)
-            glBindTexture(GL_TEXTURE_2D, self.src_texture)
-            glBindBuffer(GL_PIXEL_PACK_BUFFER,0)
-            glGetTexImage(GL_TEXTURE_2D,0,GL_RGB,GL_UNSIGNED_BYTE,ctypes.c_void_p(self.buffer_rgb.ctypes.data))
-            glBindBuffer(GL_PIXEL_PACK_BUFFER, 0)
-        elif self.target=='cuda':
-            glActiveTexture(GL_TEXTURE0)
-            glBindTexture(GL_TEXTURE_2D, self.src_texture)
-            glBindBuffer(GL_PIXEL_PACK_BUFFER,self.pbo_rgb)
-            glGetTexImage(GL_TEXTURE_2D,0,GL_RGB,GL_UNSIGNED_BYTE,0)
-            glBindBuffer(GL_PIXEL_PACK_BUFFER, 0)
-            with CUDAMappedPBOPtr(self.pbo_rgb) as ptr:
-                cuda_memcpy_2d(src=ptr,
-                        dst=self.buffer_rgb.ptr,
-                        spitch=self.width*3,
-                        dpitch=self.buffer_rgb.strides[0],
-                        width=self.width*3,
-                        height=self.height)
-                
-    @property            
-    def rgb_plane(self):
-        if self.target=='cpu':
-            return self.buffer_rgb
-        elif self.target=='cuda':
-            return dlpack.asdlpack(self.buffer_rgb)
-        
-    @property
-    def planes(self):
-        return (self.rgb_plane,)
-
 class CudaBridgeNV12:
-    #improperly named cuda as it may return numpy or cuda buffer compliant with __dlpack__
     def __init__(self,src_texture,width=None, height=None,px_format='nv12',target='cuda'):
-        ##pycuda/gl init requires a valid gl context!
-        if CUDA_API=='PYCUDA':
-            import pycuda.autoinit
-            import pycuda.gl.autoinit
-
+        '''create_cuda_buffers should only be set to true when the
+        gl_only: do not create buffer. just make rgb->nv12 conversion
+        cpu: put y and uv planes in numpy arrays (otherwise cuda)
+        '''
         self.src_texture=src_texture
         if width is None or height is None:
             self.width=glGetTexLevelParameteriv(self.src_texture,0,GL_TEXTURE_WIDTH)
@@ -247,8 +156,12 @@ class CudaBridgeNV12:
         glDeleteFramebuffers(2,np.array([self.fbo_y,self.fbo_uv]))
         if self.target:
             glDeleteBuffers(2,np.array([self.pbo_y,self.pbo_uv]))                   # release pbo
-        del self.buffer_y
-        del self.buffer_uv
+        if self.target=='cuda':
+            del self.cuda_y
+            del self.cuda_uv
+        elif self.target=='cpu':
+            del self.cpu_y
+            del self.cpu_uv
 
     def mkshaders(self):
         cvt='''
@@ -431,20 +344,20 @@ class CudaBridgeNV12:
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER,self.pbo_y)
         glBufferData(GL_PIXEL_UNPACK_BUFFER,self.pbosize_y,c_void_p(0),GL_STREAM_READ)
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0)
-        if self.target=='cuda':# and CUDA_API=='PYCUDA':
-            self.buffer_y=GPUArray((self.height,self.width),np.uint8)    
+        if self.target=='cuda':
+            self.cuda_y=GPUArray((self.height,self.width),np.uint8)
         elif self.target=='cpu':
-            self.buffer_y=np.empty((self.height, self.width),dtype=np.uint8)
+            self.cpu_y=np.empty((self.height, self.width),dtype=np.uint8)
         
         self.pbosize_uv=self.width*self.height//2
         self.pbo_uv=GLuint(0);glGenBuffers(1,self.pbo_uv);self.pbo_uv=self.pbo_uv.value ## hack to make it work with pyglet
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER,self.pbo_uv)
         glBufferData(GL_PIXEL_UNPACK_BUFFER,self.pbosize_uv,c_void_p(0),GL_STREAM_READ)
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0)
-        if self.target=='cuda':# and CUDA_API=='PYCUDA':
-            self.buffer_uv=GPUArray((self.height//2,self.width,),np.uint8)
+        if self.target=='cuda':
+            self.cuda_uv=GPUArray((self.height//2,self.width,),np.uint8)
         elif self.target=='cpu':
-            self.buffer_uv=np.empty((self.height//2, self.width),dtype=np.uint8)
+            self.cpu_uv=np.empty((self.height//2, self.width),dtype=np.uint8)
 
     def blit(self):
         ## draw to our framebuffer, ie player texture
@@ -492,59 +405,64 @@ class CudaBridgeNV12:
         if self.target=='cpu':
             glBindBuffer(GL_PIXEL_PACK_BUFFER, self.pbo_y)
             glGetBufferSubData(GL_PIXEL_PACK_BUFFER,0,self.width*self.height,
-                               ctypes.c_void_p(self.buffer_y.ctypes.data))
+                               ctypes.c_void_p(self.cpu_y.ctypes.data))
             glBindBuffer(GL_PIXEL_PACK_BUFFER, self.pbo_uv)
             glGetBufferSubData(GL_PIXEL_PACK_BUFFER,0,self.width*self.height//2,
-                                ctypes.c_void_p(self.buffer_uv.ctypes.data))
+                                ctypes.c_void_p(self.cpu_uv.ctypes.data))
             ## from PIL import Image
             ## Image.fromarray(self.cpu_uv).show()
         elif self.target=='cuda':
-            with CUDAMappedPBOPtr(self.pbo_y) as ptr:
-                cuda_memcpy_2d(src=ptr,
-                        dst=self.buffer_y.ptr,
-                        spitch=self.width,
-                        dpitch=self.buffer_y.strides[0],
-                        width=self.width,
-                        height=self.height)
-            with CUDAMappedPBOPtr(self.pbo_uv) as ptr:
-                cuda_memcpy_2d(src=ptr,
-                        dst=self.buffer_uv.ptr,
-                        spitch=self.width,
-                        dpitch=self.buffer_uv.strides[0],
-                        width=self.width,
-                        height=self.height//2)
-            
+            cuda_pbo = RegisteredBuffer(self.pbo_y)           ## in order to get gpu<->gpu copies in both encoder and decoder, one need to re-register the buffer!
+            buffer_mapping = cuda_pbo.map()
+            buffptr,buffsize=buffer_mapping.device_ptr_and_size()
+            dst_offset=0 ## offset in gl buffer
+            cpy = pycuda.driver.Memcpy2D()                      ## don't need to recreate it each frame?
+            cpy.set_src_device(buffptr) ##(info.ptr)
+            cpy.set_dst_device(self.cuda_y.ptr)        ##(buffptr+dst_offset)                       
+            cpy.width_in_bytes = self.width            ##info.width_in_bytes ##pbuff.width*pbuff.components
+            cpy.src_pitch = 0                          #info.stride    ## plane.pitch
+            cpy.dst_pitch = self.cuda_y.strides[0]     ##info.stride    ## because glbuffer is mapped to cuda, it uses the same stride; we later specify glPixelStorei(GL_UNPACK_ROW_LENGTH, self.player.decoded.planes[0].line_size)
+            cpy.height = self.height       ## plane.height
+            cpy(aligned=False)
+            pycuda.driver.Context.synchronize()
+            buffer_mapping.unmap()
+            #from PIL import Image
+            #Image.fromarray(self.cuda_y.get()).show()
+            cuda_pbo = RegisteredBuffer(self.pbo_uv)           ## in order to get gpu<->gpu copies in both encoder and decoder, one need to re-register the buffer!
+            buffer_mapping = cuda_pbo.map()
+            buffptr,buffsize=buffer_mapping.device_ptr_and_size()
+            dst_offset=0 ## offset in gl buffer
+            cpy = pycuda.driver.Memcpy2D()
+            cpy.set_src_device(buffptr)
+            cpy.set_dst_device(self.cuda_uv.ptr)
+            cpy.width_in_bytes = self.width
+            cpy.src_pitch = 0
+            cpy.dst_pitch = self.cuda_uv.strides[0]
+            cpy.height = self.height//2
+            cpy(aligned=False)
+            pycuda.driver.Context.synchronize()
+            buffer_mapping.unmap()
+
         glBindBuffer(GL_PIXEL_PACK_BUFFER, 0)
         glUseProgram(0)
         glViewport(*vp)
 
     @property
     def y_plane(self):
-        ## theoretically, one could return dlpack.asdlpack(self.cpu_y)
-        ## which would enable juggling with different names!
         if self.target=='cpu':
-            return self.buffer_y
+            return self.cpu_y
         elif self.target=='cuda':
-            return dlpack.asdlpack(self.buffer_y)
+            return dlpack.asdlpack(self.cuda_y)
     
     @property
     def uv_plane(self):
         if self.target=='cpu':
-            return self.buffer_uv
+            return self.cpu_uv
         elif self.target=='cuda':
-            return dlpack.asdlpack(self.buffer_uv)
-        
-    @property
-    def planes(self):
-        return (self.y_plane,self.uv_plane)
+            return dlpack.asdlpack(self.cuda_uv)
 
 class GLBridgeNV12:
     def __init__(self,player,player_texture,px_format='nv12',dual=False):
-        ##pycuda/gl init requires a valid gl context!
-        if CUDA_API=='PYCUDA':
-            import pycuda.autoinit
-            import pycuda.gl.autoinit
-
         self.player=player
         self.player_texture=player_texture
         self.dual=dual
@@ -558,7 +476,6 @@ class GLBridgeNV12:
             self.pbos=itertools.cycle([self.pbo1])
         self.contrast=1.0
         self.brightness=0.0
-        self.numplanes=-1
 
     def __del__(self):
         try:
@@ -567,7 +484,7 @@ class GLBridgeNV12:
             pass
 
     def release(self):
-        ## must be explicilety called. we cannot rely on __del__ as garbage collection being asynchronous, 
+        ## must be explicilety called. we cannot rely on __del__ as grabage collection being asynchronous, 
         ## the __del__ function may be called after the context has been destroyed
         glUseProgram(0)
         glDeleteProgram(self.program)               # release program
@@ -578,7 +495,7 @@ class GLBridgeNV12:
                 glDeleteTextures(t)
         glBindFramebuffer(GL_FRAMEBUFFER,0)
         glDeleteFramebuffers(1,[self.fbo])
-        glDeleteBuffers(1,[self.pbo1])              # release pbo
+        glDeleteBuffers(1,[self.pbo1])                   # release pbo
         if self.dual:
             glDeleteBuffers(1,[self.pbo2]) 
 
@@ -656,9 +573,10 @@ class GLBridgeNV12:
         self.utex_loc=glGetUniformLocation(self.program, b'utex')
         self.contrast_loc=glGetUniformLocation(self.program, b'sContrastValue')
         self.brightness_loc=glGetUniformLocation(self.program, b'sBrightnessValue')
+        #self.vtex_loc=glGetUniformLocation(self.program, b'vtex')
 
     def mkbuffers(self):
-        ## create a texture to hold y and uv components
+        ##create a texture to hold y and uv components
         self.ytex=glGenTextures(1)
         glActiveTexture(GL_TEXTURE1)
         glBindTexture(GL_TEXTURE_2D,self.ytex)
@@ -737,7 +655,6 @@ class GLBridgeNV12:
         self.vao=glGenVertexArrays(1)
 
     def blit(self,unit=GL_TEXTURE0):
-        self.numplanes=len(self.player.planes)
         infos=[__gl_unpack__(p) for p in self.player.planes]
         self.pbosize=np.sum([nfo.size_in_bytes for nfo in infos])
         pbo_=next(self.pbos)
@@ -745,10 +662,33 @@ class GLBridgeNV12:
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER,pbo_)
         glBufferData(GL_PIXEL_UNPACK_BUFFER,self.pbosize,c_void_p(0),GL_STREAM_DRAW)
 
-        dst_offset=0
-        for info in infos:
-            dlpack_to_pbo(info,pbo_,dst_offset)
-            dst_offset+=info.size_in_bytes
+        if all([nfo.device_type==1 for nfo in infos]):  ## data is on cpu
+            dst_offset=0
+            for info in infos:
+                glBufferSubData(GL_PIXEL_UNPACK_BUFFER,
+                            dst_offset,  
+                            info.width_in_bytes*info.height,
+                            cast(info.ptr,POINTER(c_byte))
+                            )
+                dst_offset+=info.size_in_bytes
+
+        elif all([nfo.device_type==2 for nfo in infos]): ## data is on cuda device
+            cuda_pbo = RegisteredBuffer(pbo_)           ## in order to get gpu<->gpu copies in both encoder and decoder, one need to re-register the buffer!
+            buffer_mapping = cuda_pbo.map()
+            buffptr,buffsize=buffer_mapping.device_ptr_and_size()
+            dst_offset=0 ## offset in gl buffer
+            for info in infos:
+                cpy = pycuda.driver.Memcpy2D()                      ## don't need to recreate it each frame?
+                cpy.set_src_device(info.ptr)
+                cpy.set_dst_device(buffptr+dst_offset)                       
+                cpy.width_in_bytes = info.width_in_bytes ##pbuff.width*pbuff.components
+                cpy.src_pitch = info.stride    ## plane.pitch
+                cpy.dst_pitch = info.stride    ## because glbuffer is mapped to cuda, it uses the same stride; we later specify glPixelStorei(GL_UNPACK_ROW_LENGTH, self.player.decoded.planes[0].line_size)
+                cpy.height = info.height       ## plane.height
+                dst_offset+=info.size_in_bytes ##(pbuff.pitch*pbuff.components)*pbuff.height
+                cpy(aligned=False)
+            pycuda.driver.Context.synchronize()
+            buffer_mapping.unmap()
         
         #update ytex
         glActiveTexture(GL_TEXTURE0)
@@ -791,11 +731,6 @@ class GLBridgeNV12:
 
 class GLBridgeYUV420:
     def __init__(self,player,player_texture,px_format='yuv420',dual=False):
-        ##pycuda/gl init requires a valid gl context!
-        if CUDA_API=='PYCUDA':
-            import pycuda.autoinit
-            import pycuda.gl.autoinit
-
         self.player=player
         self.player_texture=player_texture
         self.dual=dual
@@ -809,7 +744,6 @@ class GLBridgeYUV420:
             self.pbos=itertools.cycle([self.pbo1])
         self.contrast=1.0
         self.brightness=0.0
-        self.numplanes=-1
 
     def __del__(self):
         try:
@@ -998,7 +932,6 @@ class GLBridgeYUV420:
         self.vao=glGenVertexArrays(1)
 
     def blit(self,unit=GL_TEXTURE0):
-        self.numplanes=len(self.player.planes)
         infos=[__gl_unpack__(p) for p in self.player.planes]
         self.pbosize=np.sum([nfo.size_in_bytes for nfo in infos])
         pbo_=next(self.pbos)
@@ -1006,10 +939,33 @@ class GLBridgeYUV420:
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER,pbo_)
         glBufferData(GL_PIXEL_UNPACK_BUFFER,self.pbosize,c_void_p(0),GL_STREAM_DRAW)
 
-        dst_offset=0
-        for info in infos:
-            dlpack_to_pbo(info,pbo_,dst_offset)
-            dst_offset+=info.size_in_bytes
+        if all([nfo.device_type==1 for nfo in infos]):  ## data is on cpu
+            dst_offset=0
+            for e,info in enumerate(infos):
+                glBufferSubData(GL_PIXEL_UNPACK_BUFFER,
+                            dst_offset,  
+                            info.width_in_bytes*info.height,
+                            cast(info.ptr,POINTER(c_byte))
+                            )
+                dst_offset+=info.size_in_bytes
+                #Image.fromarray(np.ctypeslib.as_array(cast(info.ptr,POINTER(c_byte)),shape=(1440,1440))).show()
+        elif all([nfo.device_type==2 for nfo in infos]): ## data is on cuda device
+            cuda_pbo = RegisteredBuffer(pbo_)           ## in order to get gpu<->gpu copies in both encoder and decoder, one need to re-register the buffer!
+            buffer_mapping = cuda_pbo.map()
+            buffptr,buffsize=buffer_mapping.device_ptr_and_size()
+            dst_offset=0 ## offset in gl buffer
+            for info in infos:
+                cpy = pycuda.driver.Memcpy2D()                      ## don't need to recreate it each frame?
+                cpy.set_src_device(info.ptr)
+                cpy.set_dst_device(buffptr+dst_offset)                       
+                cpy.width_in_bytes = info.width_in_bytes ##pbuff.width*pbuff.components
+                cpy.src_pitch = info.stride    ## plane.pitch
+                cpy.dst_pitch = info.stride    ## because glbuffer is mapped to cuda, it uses the same stride; we later specify glPixelStorei(GL_UNPACK_ROW_LENGTH, self.player.decoded.planes[0].line_size)
+                cpy.height = info.height       ## plane.height
+                dst_offset+=info.size_in_bytes ##(pbuff.pitch*pbuff.components)*pbuff.height
+                cpy(aligned=False)
+            pycuda.driver.Context.synchronize()
+            buffer_mapping.unmap()
 
         #update ytex
         glActiveTexture(GL_TEXTURE0)
@@ -1067,11 +1023,6 @@ class GLBridgeYUV420:
 
 class GLBridgeRGB:
     def __init__(self,player,player_texture,dual=False):
-        ##pycuda/gl init requires a valid gl context!
-        if CUDA_API=='PYCUDA':
-            import pycuda.autoinit
-            import pycuda.gl.autoinit
-
         self.player=player
         self.player_texture=player_texture
         self.pbosize=self.player.width*self.player.height*3
@@ -1084,7 +1035,6 @@ class GLBridgeRGB:
             self.pbos=itertools.cycle([self.pbo1])
         self.brightness=0.0 ## fake, unused brightness for API
         self.contrast=1.0   ## fake, unused contrast for API
-        self.numplanes=-1
 
     def __del__(self):
         try:
@@ -1115,7 +1065,6 @@ class GLBridgeRGB:
         pass
 
     def blit(self,unit=GL_TEXTURE0):
-        self.numplanes=len(self.player.planes)
         info=__gl_unpack__(self.player.planes[0])
         self.pbosize=info.width_in_bytes*info.height
         pbo_=next(self.pbos)
@@ -1123,17 +1072,61 @@ class GLBridgeRGB:
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER,pbo_)
         glBufferData(GL_PIXEL_UNPACK_BUFFER,self.pbosize,c_void_p(0),GL_STREAM_DRAW)
 
-        dlpack_to_pbo(info,pbo_,0,dst_stride=info.width) ## copy as contiguous array - can't get it to work with stride!
-        
+        if info.device_type==1:  ## data is on cpu
+            glBufferSubData(GL_PIXEL_UNPACK_BUFFER,
+                            0,  
+                            info.width_in_bytes*info.height,
+                            cast(info.ptr,POINTER(c_byte))
+                            )
+        elif info.device_type==2: ## data is on cuda device
+            cuda_pbo = RegisteredBuffer(pbo_)           ## in order to get gpu<->gpu copies in both encoder and decoder, one need to re-register the buffer!
+            buffer_mapping = cuda_pbo.map()
+            buffptr,buffsize=buffer_mapping.device_ptr_and_size()
+            cpy = pycuda.driver.Memcpy2D()                      ## don't need to recreate it each frame?
+            cpy.set_src_device(info.ptr)
+            cpy.set_dst_device(buffptr)                       
+            cpy.width_in_bytes = info.width ## make a contiguous buffer on GL side
+            cpy.src_pitch = info.stride     ## plane.pitch
+            cpy.dst_pitch = info.width      ## make a contiguous buffer on GL side
+            cpy.height = info.height        ## plane.height
+            cpy(aligned=False)
+            pycuda.driver.Context.synchronize()
+            buffer_mapping.unmap()
+
         glActiveTexture(GL_TEXTURE0)
         glBindTexture(GL_TEXTURE_2D, self.player_texture)
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, int(pbo_))
-        #if info.device_type==2:
-        #    glPixelStorei(GL_UNPACK_ROW_LENGTH, info.stride//3)
+        #glPixelStorei(GL_UNPACK_ROW_LENGTH, infos[2].stride)
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
                             self.player.width, 
                             self.player.height,
                             GL_RGB, GL_UNSIGNED_BYTE, c_void_p(0))
-        if info.device_type==2:
-            glPixelStorei(GL_UNPACK_ROW_LENGTH, 0)
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0)
+        '''
+        src_plane=self.player._gpu_data().pbuffers[0]
+        cuda_pbo = RegisteredBuffer(int(self.pbo)) ## in order to get gpugpu copies in both encoder and decoder, one need to re-register the buffer!
+        buffer_mapping = cuda_pbo.map()
+        buffptr,buffsize=buffer_mapping.device_ptr_and_size()
+        cpy = pycuda.driver.Memcpy2D() ## don't need to recreate it each frame!
+        cpy.set_src_device(src_plane.ptr)
+        cpy.set_dst_device(buffptr)
+        cpy.width_in_bytes = src_plane.width
+        cpy.src_pitch = src_plane.pitch
+        cpy.dst_pitch = self.player.width*src_plane.components
+        cpy.height = src_plane.height
+        cpy(aligned=False)
+        pycuda.driver.Context.synchronize()
+        buffer_mapping.unmap()
+        '''
+        '''
+        dlpack2GL(self.player.cvtSurface.Planes[0], self.pbo)
+        ## opengl update texture from pbo
+        glActiveTexture(unit)
+        glBindTexture(GL_TEXTURE_2D, self.player_texture)
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, int(self.pbo))
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
+                        self.player.width, 
+                        self.player.height,
+                        GL_RGB, GL_UNSIGNED_BYTE, c_void_p(0))
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0)
+        '''

@@ -11,6 +11,7 @@ vali_pixel_formats={
  'rgb': vali.PixelFormat.RGB,
  'nv12': vali.PixelFormat.NV12,
  'yuv420': vali.PixelFormat.YUV420,
+ 'yuv420p': vali.PixelFormat.YUV420,
  'rgb_planar': vali.PixelFormat.RGB_PLANAR,
  'bgr': vali.PixelFormat.BGR,
  'yuv444': vali.PixelFormat.YUV444,
@@ -206,7 +207,7 @@ class FrameGrabberVALI(object):
                 self.cpu_buffers=[np.zeros(self.width*3*self.height,np.uint8)]
                 success,info=self.nvDwn.Run(self.decoded, self.cpu_buffers[0])
                 if not success:
-                    print("failed downloading yuv surface!")
+                    print("failed downloading rgb surface!")
                     return success,info
                 self.cpu_buffers[0]=self.cpu_buffers[0].reshape(self.height,self.width,3)
                 ##Image.fromarray(self.cpu_buffers[0].reshape(2880,5760,3)).show()               
